@@ -62,7 +62,7 @@ class HDF5Manager:
             metrics_group = self.file[group_name]['Metrics']
             signals_group = self.file[group_name]['Signals']
             timestamps = metrics_group['timestamp'][:].tolist()
-
+    
             atbs_values, atbs_timestamps, atbs_cumulative = [], [], 0
             for i in range(atbs_window - 1, len(timestamps)):
                 window = timestamps[i - atbs_window + 1:i + 1]
@@ -70,7 +70,7 @@ class HDF5Manager:
                 atbs_cumulative += atbs
                 atbs_values.append(atbs_cumulative)
                 atbs_timestamps.append(timestamps[i])
-
+    
             return {
                 'B0':             metrics_group['B0'][:].tolist(),
                 'B1':             metrics_group['B1'][:].tolist(),
@@ -78,6 +78,8 @@ class HDF5Manager:
                 'eqFreq':         metrics_group['eqFreq'][:].tolist(),
                 'eqTime':         metrics_group['eqTime'][:].tolist(),
                 'vpp':            metrics_group['vpp'][:].tolist(),
+                'kurtosis':       metrics_group['kurtosis'][:].tolist(),   # ← agregar
+                'skewness':       metrics_group['skewness'][:].tolist(),   # ← agregar
                 'timestamp':      timestamps,
                 'ATBS':           atbs_values,
                 'ATBS_timestamp': atbs_timestamps,

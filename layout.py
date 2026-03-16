@@ -377,6 +377,8 @@ def app_layout(app):
         'energy': 'Energy', 'eqFreq': 'Eq. Frequency',
         'eqTime': 'Eq. Time', 'vpp': 'Vpp',
         'timestamp': 'Timestamp', 'ATBS': 'ATBS',
+        'kurtosis': 'Kurtosis',       # ← agregar
+        'skewness': 'Skewness',       # ← agregar
     }
     available_metrics = list(metric_labels.keys())
     metric_opts = [{'label': metric_labels[m], 'value': m} for m in available_metrics]
