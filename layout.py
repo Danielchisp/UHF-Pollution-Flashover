@@ -171,11 +171,44 @@ def make_header():
 def make_explore_tab(metric_opts):
     return html.Div([
         html.Div([
+            # ── Selector de grupo ────────────────────────────────────────
             control_block(
                 styled_dropdown('dropdown-group', [], None,
                                 placeholder='Select measurement group…', width='280px'),
                 label='Group',
             ),
+            # ── Atributos del grupo ──────────────────────────────────────
+            control_block(
+                html.Div(
+                    id='group-rated-voltage',
+                    children='—',
+                    style={
+                        'fontFamily': FONT_MONO,
+                        'fontSize': '13px',
+                        'color': C['cyan'],
+                        'letterSpacing': '0.05em',
+                        'fontWeight': '600',
+                        'minWidth': '60px',
+                    },
+                ),
+                label='Rated Voltage (kV)',
+            ),
+            control_block(
+                html.Div(
+                    id='group-flashover-status',
+                    children='—',
+                    style={
+                        'fontFamily': FONT_MONO,
+                        'fontSize': '13px',
+                        'color': C['text_dim'],
+                        'letterSpacing': '0.05em',
+                        'fontWeight': '600',
+                        'minWidth': '60px',
+                    },
+                ),
+                label='Flashover',
+            ),
+            # ── Separador ───────────────────────────────────────────────
             vdivider(),
             control_block(
                 styled_dropdown('dropdown-y-axis', metric_opts, ['vpp'],
@@ -220,7 +253,7 @@ def make_explore_tab(metric_opts):
                 label='Scatter  Z',
             ),
             vdivider(),
-            # ── Controles de animación ──────────────────────────────────
+            # ── Controles de animación ───────────────────────────────────
             control_block(
                 dcc.Checklist(
                     id='animate-mode',
@@ -259,7 +292,7 @@ def make_explore_tab(metric_opts):
                 ),
                 label='Speed (ms)',
             ),
-            # ── fin animación ───────────────────────────────────────────
+            # ── fin animación ────────────────────────────────────────────
             vdivider(),
             control_block([
                 action_button('btn-download-scatter', '↓ CSV'),
@@ -377,8 +410,9 @@ def app_layout(app):
         'energy': 'Energy', 'eqFreq': 'Eq. Frequency',
         'eqTime': 'Eq. Time', 'vpp': 'Vpp',
         'timestamp': 'Timestamp', 'ATBS': 'ATBS',
-        'kurtosis': 'Kurtosis',       # ← agregar
-        'skewness': 'Skewness',       # ← agregar
+        'kurtosis': 'Kurtosis',
+        'skewness': 'Skewness',
+        'crest_factor': 'crest_factor'
     }
     available_metrics = list(metric_labels.keys())
     metric_opts = [{'label': metric_labels[m], 'value': m} for m in available_metrics]
