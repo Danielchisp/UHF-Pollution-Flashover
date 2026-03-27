@@ -294,13 +294,17 @@ def make_explore_tab(metric_opts):
             ),
             # ── fin animación ────────────────────────────────────────────
             vdivider(),
-            control_block([
-                action_button('btn-download-scatter', '↓ CSV'),
-                dcc.Download(id='download-scatter-csv'),
-                html.Div(style={'height': '4px'}),
-                action_button('btn-download-signals', '↓ Signals', C['green']),
-                dcc.Download(id='download-signals-csv'),
-            ], label='Export'),
+            # ── Export ───────────────────────────────────────────────────
+            control_block(
+                html.Div([
+                    action_button('btn-download-scatter', '↓ CSV'),
+                    html.Div(style={'width': '8px'}),
+                    action_button('btn-download-signals', '↓ Signals', C['green']),
+                    html.Div(style={'width': '8px'}),
+                    action_button('btn-download-signal-names', '↓ Names', C['cyan_dim']),
+                ], style={'display': 'flex', 'alignItems': 'center'}),
+                label='Export',
+            ),
             vdivider(),
             control_block([
                 dcc.Input(id='input-selection-name', type='text',
@@ -418,7 +422,12 @@ def app_layout(app):
     metric_opts = [{'label': metric_labels[m], 'value': m} for m in available_metrics]
 
     app.layout = html.Div([
+        # ── Stores y Downloads (invisibles) ─────────────────────────────
         dcc.Store(id='store-selections', data=[]),
+        dcc.Download(id='download-scatter-csv'),
+        dcc.Download(id='download-signals-csv'),
+        dcc.Download(id='download-signal-names-csv'),
+        # ────────────────────────────────────────────────────────────────
         make_header(),
         dcc.Tabs(id='main-tabs', value='tab-explore', children=[
             dcc.Tab(label='EXPLORE', value='tab-explore', style={

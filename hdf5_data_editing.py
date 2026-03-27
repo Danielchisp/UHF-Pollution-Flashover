@@ -12,7 +12,11 @@ band_ranges = [(0, 100e6), (100e6, 600e6)]
 band_names = ['B0', 'B1']
 mtrcs_keys = ['energy', 'eqTime', 'eqFreq', 'vpp']
 FS = 3e9
-FC_HPF = 300e6
+FC_HPF = 10e6
+
+# ── Si True, borra y recalcula Metrics aunque ya existan ──────────────────
+FORCE_RECALC = False
+# ─────────────────────────────────────────────────────────────────────────
 
 EXPECTED_DATASETS = set(mtrcs_keys + band_names + ['timestamp', 'kurtosis', 'skewness', 'crest_factor'])
 
@@ -46,101 +50,100 @@ def get_missing_datasets(group) -> set:
 with h5py.File(file, 'a') as f:
     for group_name in tqdm(f.keys(), desc="Grupos"):
         group = f[group_name]
-        
-        # Verificar si ya tiene todos los datasets
-        if metrics_are_complete(group):
-            tqdm.write(f"[SKIP] {group_name} ya tiene métricas completas.")
-            continue
-        
-        # Si existe Metrics pero incompleto, ver qué datasets faltan
-        if 'Metrics' in group:
-            missing_datasets = get_missing_datasets(group)
-            tqdm.write(f"[UPDATE] {group_name} tiene Metrics incompleto, faltan: {missing_datasets}")
-            recalc_all = False  # No eliminamos el grupo, solo calculamos lo faltante
-        else:
-            tqdm.write(f"[NUEVO] {group_name} sin métricas, calculando...")
+
+        if FORCE_RECALC:
+            # Borrar Metrics existente para recalcular desde cero
+            if 'Metrics' in group:
+                del group['Metrics']
+                tqdm.write(f"[FORCE] {group_name}: Metrics eliminado para recalcular.")
             group.create_group('Metrics')
             missing_datasets = EXPECTED_DATASETS.copy()
-            recalc_all = True
-        
+
+        else:
+            # Comportamiento normal: saltar si está completo, completar si falta algo
+            if metrics_are_complete(group):
+                tqdm.write(f"[SKIP] {group_name} ya tiene métricas completas.")
+                continue
+
+            if 'Metrics' in group:
+                missing_datasets = get_missing_datasets(group)
+                tqdm.write(f"[UPDATE] {group_name} tiene Metrics incompleto, faltan: {missing_datasets}")
+            else:
+                tqdm.write(f"[NUEVO] {group_name} sin métricas, calculando...")
+                group.create_group('Metrics')
+                missing_datasets = EXPECTED_DATASETS.copy()
+
         # Preparar listas para datasets faltantes
         temp_dict_metrics = []
         timestamp_list = []
         kurtosis_list = []
         skewness_list = []
         crest_factor_list = []
-        
-        # Procesar señales solo si es necesario
+
         need_signal_processing = any([
             'timestamp' in missing_datasets,
             any(m in missing_datasets for m in mtrcs_keys),
             any(b in missing_datasets for b in band_names),
             'kurtosis' in missing_datasets,
             'skewness' in missing_datasets,
-            'crest_factor' in missing_datasets
+            'crest_factor' in missing_datasets,
         ])
-        
+
         if need_signal_processing:
             for signall in tqdm(group['Signals'], desc="Señales", leave=False):
                 signal_data = group['Signals'][signall][:]
                 signal_filtered = apply_highpass(signal_data, FS, FC_HPF, order=3)
-                
-                # Calcular métricas solo si algún dataset relacionado falta
-                if any([m in missing_datasets for m in mtrcs_keys + band_names]):
+
+                if any(m in missing_datasets for m in mtrcs_keys + band_names):
                     metrics = all_metrics(time_ref, signal_filtered, FS, band_ranges=band_ranges)
                     temp_dict_metrics.append(metrics)
-                
-                # Timestamp
+
                 if 'timestamp' in missing_datasets:
                     timestamp_list.append(
                         group['Signals'][signall].attrs.get('timestamp_s', 0.0)
                     )
-                
-                # Kurtosis
+
                 if 'kurtosis' in missing_datasets:
                     kurtosis_list.append(kurtosis(signal_filtered, fisher=True, bias=True))
-                
-                # Skewness
+
                 if 'skewness' in missing_datasets:
                     skewness_list.append(skew(signal_filtered, bias=True))
-                
-                # Crest Factor
+
                 if 'crest_factor' in missing_datasets:
                     crest_factor_list.append(compute_crest_factor(signal_filtered))
-        
+
         # Guardar datasets faltantes
         metrics_group = group['Metrics']
-        
+
         if 'timestamp' in missing_datasets and timestamp_list:
             try:
                 metrics_group.create_dataset(
                     'timestamp',
-                    data=np.array(timestamp_list) - timestamp_list[0]
+                    data=np.array(timestamp_list) - timestamp_list[0],
                 )
             except Exception as e:
                 print(f'Error timestamp en {group_name}: {e}')
-        
-        # Guardar métricas principales
+
         for metric in mtrcs_keys:
             if metric in missing_datasets and temp_dict_metrics:
                 values = [temp_dict_metrics[i][metric] for i in range(len(temp_dict_metrics))]
                 metrics_group.create_dataset(metric, data=values)
-        
-        # Guardar band energies
+
         for band_idx, band_name in enumerate(band_names):
             if band_name in missing_datasets and temp_dict_metrics:
                 metrics_group.create_dataset(
                     band_name,
-                    data=[temp_dict_metrics[i]['bandEnergy'][band_idx] for i in range(len(temp_dict_metrics))]
+                    data=[temp_dict_metrics[i]['bandEnergy'][band_idx]
+                          for i in range(len(temp_dict_metrics))],
                 )
-        
+
         if 'kurtosis' in missing_datasets and kurtosis_list:
             metrics_group.create_dataset('kurtosis', data=np.array(kurtosis_list))
-        
+
         if 'skewness' in missing_datasets and skewness_list:
             metrics_group.create_dataset('skewness', data=np.array(skewness_list))
-        
+
         if 'crest_factor' in missing_datasets and crest_factor_list:
             metrics_group.create_dataset('crest_factor', data=np.array(crest_factor_list))
-        
+
         tqdm.write(f"[COMPLETED] {group_name}: datasets añadidos: {missing_datasets}")

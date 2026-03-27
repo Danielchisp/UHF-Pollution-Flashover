@@ -1,6 +1,6 @@
 import h5py
 
-src_file = 'Main Databases/single_group.hdf5'
+src_file = 'Main Databases/new_group.hdf5'
 dst_file = 'Main Databases/new_master.hdf5'
 
 with h5py.File(src_file, 'r') as src, h5py.File(dst_file, 'a') as dst:

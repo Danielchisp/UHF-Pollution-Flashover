@@ -79,7 +79,7 @@ class HDF5Manager:
             rh_humidity, rh_timestamps = [], []
             try:
                 rh_group      = self.file[group_name]['Relative Humidity']
-                rh_humidity   = rh_group['humidity'][:]  .tolist()
+                rh_humidity   = rh_group['humidity'][:].tolist()
                 rh_timestamps = rh_group['timestamps'][:].tolist()
                 print(f"[RH] {len(rh_humidity)} pts | "
                       f"t=[{rh_timestamps[0]:.2f}...{rh_timestamps[-1]:.2f}] | "
@@ -360,15 +360,12 @@ def app_callbacks(app, archivo_hdf5):
                 rh_t_arr = np.array(rh_t)
                 rh_y2_range = full_range(rh_h_arr)
 
-                # metrics timestamps start at 0, rh timestamps are Unix absolute
-                # align by shifting rh_t to the same origin as metrics_t
-                rh_t_shifted = rh_t_arr - rh_t_arr[0]  # now starts at 0, same as metrics_t
+                rh_t_shifted = rh_t_arr - rh_t_arr[0]
 
                 if x_mode == 'timestamp':
                     rh_x      = rh_t_shifted.tolist()
                     rh_y_plot = rh_h_arr.tolist()
                 else:
-                    # interpolate RH onto each metric timestamp (both start at 0 now)
                     metrics_t = np.array(metrics_data['timestamp'])
                     rh_y_plot = np.interp(metrics_t, rh_t_shifted, rh_h_arr).tolist()
                     rh_x      = list(range(len(metrics_t)))
@@ -694,6 +691,38 @@ def app_callbacks(app, archivo_hdf5):
             row = [col[i] if i < len(col) else '' for col in columns]
             w.writerow(row)
         return dcc.send_string(buf.getvalue(), f'signals_{selected_group}.csv')
+
+    # -- DOWNLOAD SIGNAL NAMES -----------------------------------------------
+    @app.callback(
+        Output('download-signal-names-csv', 'data'),
+        Input('btn-download-signal-names', 'n_clicks'),
+        State('dropdown-group', 'value'),
+        State('graph-3', 'selectedData'),
+        State('graph-4', 'selectedData'),
+        prevent_initial_call=True,
+    )
+    def download_signal_names(n_clicks, selected_group, ts_selection, sc_selection):
+        if not selected_group:
+            return None
+        metrics_data = hdf5_manager.get_metrics_from_group(selected_group)
+        if not metrics_data:
+            return None
+
+        selected_ids = (extract_selected_signal_ids(ts_selection)
+                        or extract_selected_signal_ids(sc_selection))
+
+        if selected_ids:
+            signal_ids = [sid for sid in metrics_data['signal_ids'] if sid in selected_ids]
+        else:
+            signal_ids = metrics_data['signal_ids']
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(['signal_id'])
+        for sid in signal_ids:
+            w.writerow([sid])
+
+        return dcc.send_string(buf.getvalue(), f'signal_names_{selected_group}.csv')
 
     @app.callback(
         Output('store-selections', 'data'),
