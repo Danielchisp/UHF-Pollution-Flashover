@@ -4,7 +4,7 @@ from callbacks import app_callbacks
 from layout import app_layout
 
 app = dash.Dash(__name__, title='UHF Pollution Flashover Monitor')
-archivo_hdf5 = 'Main Databases/new_master.hdf5'
+archivo_hdf5 = 'Main Databases/selected_25_kv_signals.hdf5'
 
 app_layout(app)
 app_callbacks(app, archivo_hdf5)

@@ -16,6 +16,7 @@ C = {
     'cyan':     '#00d4ff',
     'green':    '#00ff9d',
     'red':      '#ff3b5c',
+    'orange':   '#ffaa00',
     'text':     '#c8d0e0',
     'text_dim': '#5a6480',
 }
@@ -171,6 +172,27 @@ def filter_by_signal_ids(metrics_data, selected_ids):
     return sorted(indices) if indices else None
 
 
+def get_excluded_ids_for_group(store_excluded, group_name):
+    """Devuelve el set de signal_ids excluidos para el grupo actual."""
+    if not store_excluded or not group_name:
+        return set()
+    return set(store_excluded.get(group_name, []))
+
+
+def apply_exclusion_to_metrics(metrics_data, excluded_ids):
+    """
+    Devuelve los índices válidos (no excluidos) para el grupo actual.
+    Si excluded_ids está vacío, devuelve None (= usar todos).
+    """
+    if not excluded_ids:
+        return None
+    keep = []
+    for i, sid in enumerate(metrics_data['signal_ids']):
+        if sid not in excluded_ids:
+            keep.append(i)
+    return keep if len(keep) < len(metrics_data['signal_ids']) else None
+
+
 def full_range(arr, padding=0.05):
     mn, mx = np.min(arr), np.max(arr)
     pad = (mx - mn) * padding if mx != mn else 1
@@ -263,17 +285,87 @@ def app_callbacks(app, archivo_hdf5):
             print(f"Error leyendo atributos de grupo: {e}")
             return '--', '--', {**base_style, 'color': C['text_dim']}
 
+    # ── EXCLUSION STORE ──────────────────────────────────────────────────────
+    @app.callback(
+        Output('store-excluded', 'data'),
+        Input('btn-exclude-points',   'n_clicks'),
+        Input('btn-reset-exclusions', 'n_clicks'),
+        State('store-excluded',        'data'),
+        State('dropdown-group',        'value'),
+        State('graph-3',               'selectedData'),
+        State('graph-4',               'selectedData'),
+        prevent_initial_call=True,
+    )
+    def manage_exclusions(exc_clicks, reset_clicks,
+                          current_excluded, selected_group,
+                          ts_sel, sc_sel):
+        ctx = callback_context
+        if not ctx.triggered:
+            return no_update
+
+        triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        current_excluded = current_excluded or {}
+
+        # ── Reset: limpia exclusiones del grupo actual ───────────────────
+        if triggered_id == 'btn-reset-exclusions':
+            if selected_group and selected_group in current_excluded:
+                updated = dict(current_excluded)
+                del updated[selected_group]
+                return updated
+            return no_update
+
+        # ── Exclude: agrega los IDs seleccionados ────────────────────────
+        if triggered_id == 'btn-exclude-points':
+            if not selected_group:
+                return no_update
+            selected_ids = (extract_selected_signal_ids(ts_sel)
+                            or extract_selected_signal_ids(sc_sel))
+            if not selected_ids:
+                return no_update
+            updated = dict(current_excluded)
+            existing = set(updated.get(selected_group, []))
+            existing.update(selected_ids)
+            updated[selected_group] = list(existing)
+            return updated
+
+        return no_update
+
+    # ── EXCLUSION STATUS LABEL ───────────────────────────────────────────────
+    @app.callback(
+        Output('exclusion-status', 'children'),
+        Input('store-excluded',    'data'),
+        Input('dropdown-group',    'value'),
+    )
+    def update_exclusion_status(store_excluded, selected_group):
+        excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
+        n = len(excluded_ids)
+        if n == 0:
+            return html.Span('no exclusions active', style={
+                'color': C['text_dim'], 'fontFamily': "'JetBrains Mono', monospace",
+                'fontSize': '10px',
+            })
+        return html.Span([
+            html.Span('⊘ ', style={'color': C['orange'], 'fontSize': '12px'}),
+            html.Span(
+                f'{n} signal{"s" if n != 1 else ""} excluded from this group',
+                style={'color': C['orange'], 'fontFamily': "'JetBrains Mono', monospace",
+                       'fontSize': '10px', 'letterSpacing': '0.06em'},
+            ),
+        ])
+
     # -- TIME SERIES ---------------------------------------------------------
     @app.callback(
         Output('graph-3', 'figure'),
-        Input('dropdown-y-axis', 'value'),
-        Input('dropdown-group', 'value'),
-        Input('x-axis-mode', 'value'),
-        Input('normalize-toggle', 'value'),
-        Input('atbs-window-input', 'value'),
-        Input('graph-4', 'selectedData'),
+        Input('dropdown-y-axis',    'value'),
+        Input('dropdown-group',     'value'),
+        Input('x-axis-mode',        'value'),
+        Input('normalize-toggle',   'value'),
+        Input('atbs-window-input',  'value'),
+        Input('graph-4',            'selectedData'),
+        Input('store-excluded',     'data'),
     )
-    def update_time_series(y_metrics, selected_group, x_mode, normalize, atbs_window, scatter_selection):
+    def update_time_series(y_metrics, selected_group, x_mode, normalize,
+                           atbs_window, scatter_selection, store_excluded):
         if not selected_group:
             return empty_fig(460)
 
@@ -285,8 +377,30 @@ def app_callbacks(app, archivo_hdf5):
         if not metrics_data:
             return empty_fig(460)
 
+        # -- exclusiones permanentes (tienen prioridad) -------------------
+        excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
+        excl_keep    = apply_exclusion_to_metrics(metrics_data, excluded_ids)
+
+        # -- selección lasso sobre scatter (highlight temporal) -----------
         selected_ids = extract_selected_signal_ids(scatter_selection)
         filter_idx   = filter_by_signal_ids(metrics_data, selected_ids)
+
+        # combinar: primero aplicar exclusión, luego filtro de selección
+        def merge_indices(excl_keep, filter_idx):
+            """
+            excl_keep : lista de índices que NO están excluidos (o None = todos)
+            filter_idx: lista de índices seleccionados por lasso (o None = todos)
+            Devuelve la intersección como lista ordenada, o None si no hay restricción.
+            """
+            if excl_keep is None and filter_idx is None:
+                return None
+            base = set(excl_keep) if excl_keep is not None else set(range(len(metrics_data['signal_ids'])))
+            if filter_idx is not None:
+                base = base.intersection(filter_idx)
+            result = sorted(base)
+            return result if result else []
+
+        effective_idx = merge_indices(excl_keep, filter_idx)
 
         try:
             base_metric = next((m for m in y_metrics if m != 'ATBS'), None)
@@ -299,18 +413,31 @@ def app_callbacks(app, archivo_hdf5):
                 x_data  = list(range(len(metrics_data[base_metric]))) if base_metric else []
                 x_label = 'Index'
 
-            # compute ranges
+            # -- compute ranges usando solo los puntos visibles -----------
             all_x, all_y = [], []
             for ym in y_metrics:
                 if ym == 'ATBS':
                     xm = metrics_data['ATBS_timestamp'] if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
+                    yv = np.array(metrics_data['ATBS'])
+                    # para ATBS, el excl_keep se aplica sobre los primeros N indices
+                    if effective_idx is not None:
+                        atbs_len = len(metrics_data['ATBS'])
+                        atbs_keep = [i for i in effective_idx if i < atbs_len]
+                        xm_eff = [xm[i] for i in atbs_keep]
+                        yv_eff = yv[atbs_keep]
+                    else:
+                        xm_eff, yv_eff = xm, yv
                 else:
-                    xm = x_data
-                yv = np.array(metrics_data['ATBS'] if ym == 'ATBS' else metrics_data[ym])
+                    yv = np.array(metrics_data[ym])
+                    if effective_idx is not None:
+                        xm_eff = [x_data[i] for i in effective_idx]
+                        yv_eff = yv[effective_idx]
+                    else:
+                        xm_eff, yv_eff = x_data, yv
                 if normalize and len(y_metrics) > 1:
-                    yv = normalize_data(yv)
-                all_x.extend(xm)
-                all_y.extend(yv.tolist())
+                    yv_eff = normalize_data(yv_eff)
+                all_x.extend(xm_eff)
+                all_y.extend(yv_eff.tolist() if hasattr(yv_eff, 'tolist') else list(yv_eff))
 
             x_rng = full_range(np.array(all_x)) if all_x else None
             y_rng = full_range(np.array(all_y)) if all_y else None
@@ -323,10 +450,20 @@ def app_callbacks(app, archivo_hdf5):
                     xm   = metrics_data['ATBS_timestamp'] if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
                     yv   = np.array(metrics_data['ATBS'])
                     sids = metrics_data['signal_ids'][:len(metrics_data['ATBS'])]
+                    if effective_idx is not None:
+                        atbs_len = len(metrics_data['ATBS'])
+                        atbs_keep = [i for i in effective_idx if i < atbs_len]
+                        xm   = [xm[i] for i in atbs_keep]
+                        yv   = yv[atbs_keep]
+                        sids = [sids[i] for i in atbs_keep]
                 else:
                     xm   = x_data
                     yv   = np.array(metrics_data[ym])
                     sids = metrics_data['signal_ids']
+                    if effective_idx is not None:
+                        xm   = [xm[i] for i in effective_idx]
+                        yv   = yv[effective_idx]
+                        sids = [sids[i] for i in effective_idx]
 
                 if normalize and len(y_metrics) > 1:
                     yv = normalize_data(yv)
@@ -334,13 +471,8 @@ def app_callbacks(app, archivo_hdf5):
                 cd    = np.column_stack((np.array(sids), np.full(len(sids), selected_group)))
                 color = COLORS[idx % len(COLORS)]
 
-                if filter_idx is not None:
-                    xm = [xm[i] for i in filter_idx]
-                    yv = yv[filter_idx]
-                    cd = cd[filter_idx]
-                    marker_opacity = 0.9
-                else:
-                    marker_opacity = 0
+                # mostrar marcadores si hay selección lasso activa
+                marker_opacity = 0.9 if filter_idx is not None else 0
 
                 fig.add_trace(go.Scattergl(
                     x=xm, y=yv.tolist(), mode='lines+markers',
@@ -359,7 +491,6 @@ def app_callbacks(app, archivo_hdf5):
                 rh_h_arr = np.array(rh_h)
                 rh_t_arr = np.array(rh_t)
                 rh_y2_range = full_range(rh_h_arr)
-
                 rh_t_shifted = rh_t_arr - rh_t_arr[0]
 
                 if x_mode == 'timestamp':
@@ -413,17 +544,19 @@ def app_callbacks(app, archivo_hdf5):
     # -- SCATTER -------------------------------------------------------------
     @app.callback(
         Output('graph-4', 'figure'),
-        Input('dropdown-x-axis', 'value'),
+        Input('dropdown-x-axis',        'value'),
         Input('dropdown-y-axis-scatter', 'value'),
-        Input('dropdown-z-axis', 'value'),
-        Input('dropdown-group', 'value'),
-        Input('graph-3', 'selectedData'),
-        Input('animate-mode', 'value'),
-        Input('animate-step-input', 'value'),
-        Input('animate-speed-input', 'value'),
+        Input('dropdown-z-axis',         'value'),
+        Input('dropdown-group',          'value'),
+        Input('graph-3',                 'selectedData'),
+        Input('animate-mode',            'value'),
+        Input('animate-step-input',      'value'),
+        Input('animate-speed-input',     'value'),
+        Input('store-excluded',          'data'),
     )
     def update_scatter(x_metric, y_metric, z_metric, selected_group,
-                       ts_selection, animate_mode, anim_step, anim_speed):
+                       ts_selection, animate_mode, anim_step, anim_speed,
+                       store_excluded):
         if not selected_group:
             return empty_fig(460)
 
@@ -437,8 +570,26 @@ def app_callbacks(app, archivo_hdf5):
         if not metrics_data:
             return empty_fig(460)
 
+        # -- exclusiones permanentes --------------------------------------
+        excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
+        excl_keep    = apply_exclusion_to_metrics(metrics_data, excluded_ids)
+
+        # -- selección lasso de time series (highlight) -------------------
         selected_ids = extract_selected_signal_ids(ts_selection)
         filter_idx   = filter_by_signal_ids(metrics_data, selected_ids)
+
+        # -- índice efectivo: intersección exclusión + selección ----------
+        def effective_index(excl_keep, filter_idx, total):
+            if excl_keep is None and filter_idx is None:
+                return None
+            base = set(excl_keep) if excl_keep is not None else set(range(total))
+            if filter_idx is not None:
+                base = base.intersection(filter_idx)
+            result = sorted(base)
+            return result if result else []
+
+        eff_idx = effective_index(excl_keep, filter_idx,
+                                  len(metrics_data['signal_ids']))
 
         try:
             x_vals = np.array(metrics_data[x_metric], dtype=float)
@@ -446,16 +597,16 @@ def app_callbacks(app, archivo_hdf5):
             sids   = np.array(metrics_data['signal_ids'])
             cd     = np.column_stack((sids, np.full(len(sids), selected_group)))
 
-            if filter_idx is not None:
-                x_vals = x_vals[filter_idx]
-                y_vals = y_vals[filter_idx]
-                cd     = cd[filter_idx]
+            if eff_idx is not None:
+                x_vals = x_vals[eff_idx]
+                y_vals = y_vals[eff_idx]
+                cd     = cd[eff_idx]
 
             # -- 3D ----------------------------------------------------------
             if z_metric:
                 z_vals = np.array(metrics_data[z_metric], dtype=float)
-                if filter_idx is not None:
-                    z_vals = z_vals[filter_idx]
+                if eff_idx is not None:
+                    z_vals = z_vals[eff_idx]
                 fig = go.Figure()
                 fig.add_trace(go.Scatter3d(
                     x=x_vals, y=y_vals, z=z_vals, mode='markers',
@@ -472,8 +623,8 @@ def app_callbacks(app, archivo_hdf5):
                 fig.update_layout(layout)
                 return fig
 
-            x_rng = full_range(x_vals)
-            y_rng = full_range(y_vals)
+            x_rng = full_range(x_vals) if len(x_vals) else None
+            y_rng = full_range(y_vals) if len(y_vals) else None
 
             # -- static ------------------------------------------------------
             if not do_animate:
@@ -630,23 +781,39 @@ def app_callbacks(app, archivo_hdf5):
         State('dropdown-z-axis', 'value'),
         State('dropdown-group', 'value'),
         State('graph-3', 'selectedData'),
+        State('store-excluded', 'data'),
         prevent_initial_call=True,
     )
-    def download_scatter_csv(n_clicks, x_metric, y_metric, z_metric, selected_group, ts_selection):
+    def download_scatter_csv(n_clicks, x_metric, y_metric, z_metric,
+                             selected_group, ts_selection, store_excluded):
         if not selected_group or not x_metric or not y_metric:
             return None
         metrics_data = hdf5_manager.get_metrics_from_group(selected_group)
         if not metrics_data:
             return None
+        excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
+        excl_keep    = apply_exclusion_to_metrics(metrics_data, excluded_ids)
+
         x_vals = np.array(metrics_data[x_metric])
         y_vals = np.array(metrics_data[y_metric])
         z_vals = np.array(metrics_data[z_metric]) if z_metric else None
+
         selected_ids = extract_selected_signal_ids(ts_selection)
         filter_idx   = filter_by_signal_ids(metrics_data, selected_ids)
+
+        # merge
+        total = len(metrics_data['signal_ids'])
+        base  = set(excl_keep) if excl_keep is not None else set(range(total))
         if filter_idx is not None:
-            x_vals, y_vals = x_vals[filter_idx], y_vals[filter_idx]
+            base = base.intersection(filter_idx)
+        final_idx = sorted(base) if (excl_keep is not None or filter_idx is not None) else None
+
+        if final_idx is not None:
+            x_vals = x_vals[final_idx]
+            y_vals = y_vals[final_idx]
             if z_vals is not None:
-                z_vals = z_vals[filter_idx]
+                z_vals = z_vals[final_idx]
+
         buf = io.StringIO()
         w = csv.writer(buf)
         if z_vals is not None:
@@ -663,20 +830,29 @@ def app_callbacks(app, archivo_hdf5):
         State('dropdown-group', 'value'),
         State('graph-3', 'selectedData'),
         State('graph-4', 'selectedData'),
+        State('store-excluded', 'data'),
         prevent_initial_call=True,
     )
-    def download_signals(n_clicks, selected_group, ts_selection, sc_selection):
+    def download_signals(n_clicks, selected_group, ts_selection, sc_selection,
+                         store_excluded):
         if not selected_group:
             return None
         metrics_data = hdf5_manager.get_metrics_from_group(selected_group)
         if not metrics_data:
             return None
+
+        excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
         selected_ids = (extract_selected_signal_ids(ts_selection)
                         or extract_selected_signal_ids(sc_selection))
+
+        # filtrar: excluir excluidos + respetar selección
+        all_ids = metrics_data['signal_ids']
         if selected_ids:
-            signal_ids = [sid for sid in metrics_data['signal_ids'] if sid in selected_ids]
+            signal_ids = [sid for sid in all_ids
+                          if sid in selected_ids and sid not in excluded_ids]
         else:
-            signal_ids = metrics_data['signal_ids']
+            signal_ids = [sid for sid in all_ids if sid not in excluded_ids]
+
         columns = []
         for sid in signal_ids:
             data = hdf5_manager.get_signal_data(selected_group, sid)
@@ -699,22 +875,27 @@ def app_callbacks(app, archivo_hdf5):
         State('dropdown-group', 'value'),
         State('graph-3', 'selectedData'),
         State('graph-4', 'selectedData'),
+        State('store-excluded', 'data'),
         prevent_initial_call=True,
     )
-    def download_signal_names(n_clicks, selected_group, ts_selection, sc_selection):
+    def download_signal_names(n_clicks, selected_group, ts_selection, sc_selection,
+                              store_excluded):
         if not selected_group:
             return None
         metrics_data = hdf5_manager.get_metrics_from_group(selected_group)
         if not metrics_data:
             return None
 
+        excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
         selected_ids = (extract_selected_signal_ids(ts_selection)
                         or extract_selected_signal_ids(sc_selection))
 
+        all_ids = metrics_data['signal_ids']
         if selected_ids:
-            signal_ids = [sid for sid in metrics_data['signal_ids'] if sid in selected_ids]
+            signal_ids = [sid for sid in all_ids
+                          if sid in selected_ids and sid not in excluded_ids]
         else:
-            signal_ids = metrics_data['signal_ids']
+            signal_ids = [sid for sid in all_ids if sid not in excluded_ids]
 
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -967,7 +1148,56 @@ def app_callbacks(app, archivo_hdf5):
         layout['yaxis'] = dict(title=metric,      **AXIS_STYLE)
         fig.update_layout(layout)
         return fig
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+# PATCH: agregar estos dos clientside_callbacks al final de app_callbacks()
+# en callbacks.py, justo antes del @atexit.register
+# ─────────────────────────────────────────────────────────────────────────────
 
+    # ── COPY GROUP NAME (clientside) ─────────────────────────────────────────
+
+    # 1. Sincroniza el span oculto con el valor del dropdown
+    app.clientside_callback(
+        """
+        function(group_value) {
+            return group_value || '';
+        }
+        """,
+        Output('copy-group-name-value', 'children'),
+        Input('dropdown-group', 'value'),
+    )
+
+    # 2. Al hacer click en el botón, copia el texto del span al portapapeles
+    app.clientside_callback(
+        """
+        function(n_clicks) {
+            if (!n_clicks) return window.dash_clientside.no_update;
+            var span = document.getElementById('copy-group-name-value');
+            var text = span ? span.innerText.trim() : '';
+            if (!text) return window.dash_clientside.no_update;
+            navigator.clipboard.writeText(text).then(function() {
+                var btn = document.getElementById('btn-copy-group-name');
+                if (!btn) return;
+                var orig = btn.innerText;
+                var origColor = btn.style.color;
+                var origBorder = btn.style.borderColor;
+                btn.innerText = '\u2713';
+                btn.style.color = '#00ff9d';
+                btn.style.borderColor = '#00ff9d';
+                setTimeout(function() {
+                    btn.innerText = orig;
+                    btn.style.color = origColor;
+                    btn.style.borderColor = origBorder;
+                }, 1200);
+            });
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output('btn-copy-group-name', 'n_clicks'),
+        Input('btn-copy-group-name', 'n_clicks'),
+        prevent_initial_call=True,
+    )
+    
     @atexit.register
     def cleanup():
         if _hdf5_manager:

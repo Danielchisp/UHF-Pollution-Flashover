@@ -10,6 +10,7 @@ C = {
     'cyan_dim': '#0099bb',
     'green':    '#00ff9d',
     'red':      '#ff3b5c',
+    'orange':   '#ffaa00',
     'text':     '#c8d0e0',
     'text_dim': '#5a6480',
     'label':    '#8a94b0',
@@ -168,13 +169,94 @@ def make_header():
     })
 
 
+def make_exclude_bar():
+    return html.Div([
+        html.Button(
+            [html.Span('⊘', style={'marginRight': '5px', 'fontSize': '12px'}), 'EXCLUDE SELECTED'],
+            id='btn-exclude-points',
+            style={
+                'background': 'transparent',
+                'border': f'1px solid {C["orange"]}',
+                'color': C['orange'],
+                'fontFamily': FONT_MONO,
+                'fontSize': '10px',
+                'letterSpacing': '0.1em',
+                'padding': '5px 14px',
+                'cursor': 'pointer',
+                'borderRadius': '3px',
+                'marginRight': '8px',
+                'display': 'flex',
+                'alignItems': 'center',
+            },
+        ),
+        html.Button(
+            [html.Span('↺', style={'marginRight': '5px', 'fontSize': '13px'}), 'RESET EXCLUSIONS'],
+            id='btn-reset-exclusions',
+            style={
+                'background': 'transparent',
+                'border': f'1px solid {C["text_dim"]}',
+                'color': C['text_dim'],
+                'fontFamily': FONT_MONO,
+                'fontSize': '10px',
+                'letterSpacing': '0.1em',
+                'padding': '5px 14px',
+                'cursor': 'pointer',
+                'borderRadius': '3px',
+                'marginRight': '16px',
+                'display': 'flex',
+                'alignItems': 'center',
+            },
+        ),
+        html.Div(
+            id='exclusion-status',
+            style={
+                'fontFamily': FONT_MONO,
+                'fontSize': '10px',
+                'color': C['text_dim'],
+                'letterSpacing': '0.08em',
+                'display': 'flex',
+                'alignItems': 'center',
+            },
+        ),
+    ], style={
+        'display': 'flex',
+        'alignItems': 'center',
+        'padding': '6px 20px',
+        'background': C['bg'],
+        'borderBottom': f'1px solid {C["border"]}',
+    })
+
+
 def make_explore_tab(metric_opts):
     return html.Div([
         html.Div([
             # ── Selector de grupo ────────────────────────────────────────
             control_block(
-                styled_dropdown('dropdown-group', [], None,
-                                placeholder='Select measurement group…', width='280px'),
+                html.Div([
+                    styled_dropdown('dropdown-group', [], None,
+                                    placeholder='Select measurement group…', width='280px'),
+                    html.Button(
+                        '⎘',
+                        id='btn-copy-group-name',
+                        title='Copy group name',
+                        n_clicks=0,
+                        style={
+                            'background': 'transparent',
+                            'border': f'1px solid {C["border2"]}',
+                            'color': C['text_dim'],
+                            'fontFamily': FONT_MONO,
+                            'fontSize': '14px',
+                            'cursor': 'pointer',
+                            'borderRadius': '3px',
+                            'padding': '3px 8px',
+                            'marginLeft': '6px',
+                            'lineHeight': '1',
+                            'alignSelf': 'center',
+                        },
+                    ),
+                    # hidden span that carries the group value for the JS to read
+                    html.Span(id='copy-group-name-value', style={'display': 'none'}),
+                ], style={'display': 'flex', 'alignItems': 'center'}),
                 label='Group',
             ),
             # ── Atributos del grupo ──────────────────────────────────────
@@ -253,7 +335,6 @@ def make_explore_tab(metric_opts):
                 label='Scatter  Z',
             ),
             vdivider(),
-            # ── Controles de animación ───────────────────────────────────
             control_block(
                 dcc.Checklist(
                     id='animate-mode',
@@ -292,9 +373,7 @@ def make_explore_tab(metric_opts):
                 ),
                 label='Speed (ms)',
             ),
-            # ── fin animación ────────────────────────────────────────────
             vdivider(),
-            # ── Export ───────────────────────────────────────────────────
             control_block(
                 html.Div([
                     action_button('btn-download-scatter', '↓ CSV'),
@@ -320,6 +399,9 @@ def make_explore_tab(metric_opts):
             'background': f'linear-gradient(180deg, {C["panel"]} 0%, {C["bg"]} 100%)',
             'borderBottom': f'1px solid {C["border"]}',
         }),
+
+        # ── Barra de exclusión ───────────────────────────────────────────
+        make_exclude_bar(),
 
         html.Div([
             html.Div([
@@ -424,6 +506,7 @@ def app_layout(app):
     app.layout = html.Div([
         # ── Stores y Downloads (invisibles) ─────────────────────────────
         dcc.Store(id='store-selections', data=[]),
+        dcc.Store(id='store-excluded', data={}),
         dcc.Download(id='download-scatter-csv'),
         dcc.Download(id='download-signals-csv'),
         dcc.Download(id='download-signal-names-csv'),
@@ -458,3 +541,6 @@ def app_layout(app):
         ], style={'fontFamily': FONT_MONO}),
 
     ], style={'background': C['bg'], 'minHeight': '100vh'})
+
+# NOTE: the following clientside callbacks must be registered in app_callbacks()
+# See callbacks_copy_patch.py for the exact code to insert at the end of app_callbacks()
