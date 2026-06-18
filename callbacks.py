@@ -3,6 +3,8 @@ from dash import Input, Output, State, callback_context, dcc, html, no_update, A
 import plotly.graph_objects as go
 import h5py
 import numpy as np
+from scipy.stats import kurtosis as sp_kurtosis, skew as sp_skew
+from scipy.fft import rfft, rfftfreq
 import atexit
 import io
 import csv
@@ -45,11 +47,101 @@ AXIS_STYLE = dict(
     linecolor=C['border2'], zerolinecolor=C['border2'],
 )
 
+# Parámetros FFT para formato 2
+SAMPLE_RATE   = 3e9          # 3 GS/s — ajustar si difiere
+B0_MAX_HZ     = 100e6        # 0–100 MHz
+B1_MIN_HZ     = 100e6        # 100–600 MHz
+B1_MAX_HZ     = 600e6
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers de cálculo de métricas desde señales raw (formato 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_metrics_from_signals(signals: np.ndarray,
+                                  timestamps: np.ndarray,
+                                  sample_rate: float = SAMPLE_RATE):
+    n = len(signals)
+    vpp_list          = []
+    kurt_list         = []
+    skew_list         = []
+    crest_list        = []
+    energy_list       = []
+    eqFreq_list       = []
+    eqTime_list       = list(timestamps[:n])
+    B0_list           = []
+    B1_list           = []
+
+    for i, sig in enumerate(signals):
+        sig = sig.astype(np.float64)
+        sig_len = len(sig)
+
+        vpp    = float(sig.max() - sig.min())
+        rms    = float(np.sqrt(np.mean(sig ** 2)))
+        peak   = float(np.max(np.abs(sig)))
+        crest  = float(peak / rms) if rms > 0 else 0.0
+        energy = float(np.sum(sig ** 2))
+        kurt   = float(sp_kurtosis(sig, fisher=False))
+        skew   = float(sp_skew(sig))
+
+        freqs   = rfftfreq(sig_len, d=1.0 / sample_rate)
+        fft_mag = np.abs(rfft(sig))
+
+        peak_idx = int(np.argmax(fft_mag))
+        eq_freq  = float(freqs[peak_idx]) / 1e6   # en MHz
+
+        total_energy = float(np.sum(fft_mag ** 2)) or 1.0
+        mask_b0 = freqs <= B0_MAX_HZ
+        mask_b1 = (freqs >= B1_MIN_HZ) & (freqs <= B1_MAX_HZ)
+        b0 = float(np.sum(fft_mag[mask_b0] ** 2)) / total_energy
+        b1 = float(np.sum(fft_mag[mask_b1] ** 2)) / total_energy
+
+        vpp_list.append(vpp)
+        kurt_list.append(kurt)
+        skew_list.append(skew)
+        crest_list.append(crest)
+        energy_list.append(energy)
+        eqFreq_list.append(eq_freq)
+        B0_list.append(b0)
+        B1_list.append(b1)
+
+    return {
+        'vpp':          vpp_list,
+        'kurtosis':     kurt_list,
+        'skewness':     skew_list,
+        'crest_factor': crest_list,
+        'energy':       energy_list,
+        'eqFreq':       eqFreq_list,
+        'eqTime':       eqTime_list,
+        'B0':           B0_list,
+        'B1':           B1_list,
+        'timestamp':    list(timestamps[:n]),
+    }
+
+
+def _detect_format(group) -> str:
+    keys = list(group.keys())
+    if 'Metrics' in keys and 'Signals' in keys:
+        return 'fmt1'
+    for k in keys:
+        try:
+            sub = group[k]
+            if 'signals' in sub and 'data' in sub['signals']:
+                return 'fmt2'
+        except Exception:
+            continue
+    return 'fmt1'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HDF5Manager
+# ─────────────────────────────────────────────────────────────────────────────
 
 class HDF5Manager:
     def __init__(self, filepath):
         self.filepath = filepath
         self._file = None
+        self._fmt2_cache = {}
 
     @property
     def file(self):
@@ -60,9 +152,9 @@ class HDF5Manager:
     def get_all_groups(self):
         return list(self.file.keys())
 
-    def get_metrics_from_group(self, group_name, atbs_window=5):
-        if group_name == 'all':
-            return None
+    # ── Formato 1 ────────────────────────────────────────────────────────────
+
+    def _get_metrics_fmt1(self, group_name, atbs_window=5):
         try:
             metrics_group = self.file[group_name]['Metrics']
             signals_group = self.file[group_name]['Signals']
@@ -76,7 +168,6 @@ class HDF5Manager:
                 atbs_values.append(atbs_cumulative)
                 atbs_timestamps.append(timestamps[i])
 
-            # -- Relative Humidity --
             rh_humidity, rh_timestamps = [], []
             try:
                 rh_group      = self.file[group_name]['Relative Humidity']
@@ -105,32 +196,163 @@ class HDF5Manager:
                 'group':          group_name,
                 'rh_humidity':    rh_humidity,
                 'rh_timestamps':  rh_timestamps,
+                '_format':        'fmt1',
             }
         except Exception as e:
-            print(f"Error leyendo grupo {group_name}: {e}")
+            print(f"Error leyendo grupo fmt1 {group_name}: {e}")
             return None
 
-    def get_signal_data(self, group_name, signal_id):
+    # ── Formato 2 ────────────────────────────────────────────────────────────
+
+    def _get_metrics_fmt2(self, group_name, atbs_window=5):
+        if group_name in self._fmt2_cache:
+            return self._fmt2_cache[group_name]
+
         try:
-            return self.file[group_name]['Signals'][signal_id][:]
+            group = self.file[group_name]
+            chunk_names = sorted(group.keys())
+
+            all_metrics = {k: [] for k in
+                           ['vpp', 'kurtosis', 'skewness', 'crest_factor',
+                            'energy', 'eqFreq', 'eqTime', 'B0', 'B1', 'timestamp']}
+            all_signal_ids    = []
+            rh_humidity_all   = []
+            rh_timestamps_all = []
+
+            self._fmt2_signal_map = getattr(self, '_fmt2_signal_map', {})
+            self._fmt2_signal_map[group_name] = {}
+
+            for chunk_name in chunk_names:
+                chunk = group[chunk_name]
+                if 'signals' not in chunk or 'data' not in chunk['signals']:
+                    continue
+
+                signals_raw    = chunk['signals']['data'][:]
+                timestamps_raw = chunk['signals']['timestamps'][:]
+                n = len(signals_raw)
+                if n == 0:
+                    continue
+
+                chunk_metrics = _compute_metrics_from_signals(signals_raw, timestamps_raw)
+
+                for k in all_metrics:
+                    all_metrics[k].extend(chunk_metrics[k])
+
+                for idx in range(n):
+                    sid = f"{chunk_name}::{idx}"
+                    all_signal_ids.append(sid)
+                    self._fmt2_signal_map[group_name][sid] = (chunk_name, idx)
+
+                # Leer humedad del chunk si existe
+                try:
+                    rh_group = chunk['humidity']
+                    rh_h     = rh_group['humidity'][:]
+                    rh_t     = rh_group['timestamps'][:]
+                    rh_humidity_all.extend(rh_h.tolist())
+                    rh_timestamps_all.extend(rh_t.tolist())
+                except Exception:
+                    pass
+
+            if not all_signal_ids:
+                print(f"[fmt2] No signals found in {group_name}")
+                return None
+
+            timestamps = all_metrics['timestamp']
+
+            atbs_values, atbs_timestamps, atbs_cumulative = [], [], 0
+            for i in range(atbs_window - 1, len(timestamps)):
+                window = timestamps[i - atbs_window + 1:i + 1]
+                dt = (window[-1] - window[0]) / max(len(window) - 1, 1)
+                atbs_cumulative += dt
+                atbs_values.append(atbs_cumulative)
+                atbs_timestamps.append(timestamps[i])
+
+            # Ordenar humedad por timestamp
+            if rh_timestamps_all:
+                rh_pairs          = sorted(zip(rh_timestamps_all, rh_humidity_all))
+                rh_timestamps_all = [p[0] for p in rh_pairs]
+                rh_humidity_all   = [p[1] for p in rh_pairs]
+                print(f"[fmt2 RH] {group_name}: {len(rh_humidity_all)} pts | "
+                      f"t=[{rh_timestamps_all[0]:.2f}...{rh_timestamps_all[-1]:.2f}] | "
+                      f"h=[{rh_humidity_all[0]:.2f}...{rh_humidity_all[-1]:.2f}]")
+
+            result = {
+                **all_metrics,
+                'ATBS':           atbs_values,
+                'ATBS_timestamp': atbs_timestamps,
+                'signal_ids':     all_signal_ids,
+                'group':          group_name,
+                'rh_humidity':    rh_humidity_all,
+                'rh_timestamps':  rh_timestamps_all,
+                '_format':        'fmt2',
+            }
+            self._fmt2_cache[group_name] = result
+            print(f"[fmt2] {group_name}: {len(all_signal_ids)} señales calculadas")
+            return result
+
         except Exception as e:
-            print(f"Error leyendo senal {signal_id}: {e}")
-            return np.array([])
+            print(f"Error leyendo grupo fmt2 {group_name}: {e}")
+            import traceback; traceback.print_exc()
+            return None
+
+    # ── Interfaz pública ─────────────────────────────────────────────────────
+
+    def get_format(self, group_name):
+        try:
+            return _detect_format(self.file[group_name])
+        except Exception:
+            return 'fmt1'
+
+    def get_metrics_from_group(self, group_name, atbs_window=5):
+        if not group_name or group_name == 'all':
+            return None
+        fmt = self.get_format(group_name)
+        if fmt == 'fmt2':
+            return self._get_metrics_fmt2(group_name, atbs_window)
+        return self._get_metrics_fmt1(group_name, atbs_window)
+
+    def get_signal_data(self, group_name, signal_id):
+        fmt = self.get_format(group_name)
+        if fmt == 'fmt2':
+            try:
+                sig_map = getattr(self, '_fmt2_signal_map', {})
+                chunk_name, idx = sig_map[group_name][signal_id]
+                return self.file[group_name][chunk_name]['signals']['data'][idx].astype(np.float64)
+            except Exception as e:
+                print(f"[fmt2] Error get_signal_data {signal_id}: {e}")
+                return np.array([])
+        else:
+            try:
+                return self.file[group_name]['Signals'][signal_id][:]
+            except Exception as e:
+                print(f"Error leyendo senal {signal_id}: {e}")
+                return np.array([])
 
     def get_fft_data(self, group_name, signal_id):
-        try:
-            if 'FFT' in self.file[group_name]:
-                return self.file[group_name]['FFT'][signal_id][:]
-            return np.array([])
-        except Exception as e:
-            print(f"FFT no disponible para {signal_id}: {e}")
-            return np.array([])
+        fmt = self.get_format(group_name)
+        if fmt == 'fmt2':
+            sig = self.get_signal_data(group_name, signal_id)
+            if not len(sig):
+                return np.array([])
+            return np.abs(rfft(sig))
+        else:
+            try:
+                if 'FFT' in self.file[group_name]:
+                    return self.file[group_name]['FFT'][signal_id][:]
+                return np.array([])
+            except Exception as e:
+                print(f"FFT no disponible para {signal_id}: {e}")
+                return np.array([])
 
     def close(self):
         if self._file:
             self._file.close()
             self._file = None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Singleton
+# ─────────────────────────────────────────────────────────────────────────────
 
 _hdf5_manager = None
 
@@ -141,6 +363,10 @@ def get_hdf5_manager(filepath):
         _hdf5_manager = HDF5Manager(filepath)
     return _hdf5_manager
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers genéricos
+# ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_data(data):
     a = np.array(data)
@@ -173,17 +399,12 @@ def filter_by_signal_ids(metrics_data, selected_ids):
 
 
 def get_excluded_ids_for_group(store_excluded, group_name):
-    """Devuelve el set de signal_ids excluidos para el grupo actual."""
     if not store_excluded or not group_name:
         return set()
     return set(store_excluded.get(group_name, []))
 
 
 def apply_exclusion_to_metrics(metrics_data, excluded_ids):
-    """
-    Devuelve los índices válidos (no excluidos) para el grupo actual.
-    Si excluded_ids está vacío, devuelve None (= usar todos).
-    """
     if not excluded_ids:
         return None
     keep = []
@@ -216,6 +437,10 @@ def empty_fig(height=460):
     return fig
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Callbacks
+# ─────────────────────────────────────────────────────────────────────────────
+
 def app_callbacks(app, archivo_hdf5):
     hdf5_manager = get_hdf5_manager(archivo_hdf5)
 
@@ -242,8 +467,23 @@ def app_callbacks(app, archivo_hdf5):
         if not selected_group:
             return '00:00:00'
         try:
-            timestamps = hdf5_manager.file[selected_group]['Metrics']['timestamp'][:]
-            duration = float(np.max(timestamps) - np.min(timestamps))
+            fmt = hdf5_manager.get_format(selected_group)
+            if fmt == 'fmt2':
+                group = hdf5_manager.file[selected_group]
+                all_ts = []
+                for k in sorted(group.keys()):
+                    try:
+                        ts = group[k]['signals']['timestamps'][:]
+                        all_ts.extend(ts.tolist())
+                    except Exception:
+                        continue
+                if not all_ts:
+                    return '00:00:00'
+                duration = float(max(all_ts) - min(all_ts))
+            else:
+                timestamps = hdf5_manager.file[selected_group]['Metrics']['timestamp'][:]
+                duration = float(np.max(timestamps) - np.min(timestamps))
+
             h = int(duration // 3600)
             m = int((duration % 3600) // 60)
             s = int(duration % 60)
@@ -251,7 +491,6 @@ def app_callbacks(app, archivo_hdf5):
         except Exception:
             return '00:00:00'
 
-    # -- ATRIBUTOS DEL GRUPO -------------------------------------------------
     @app.callback(
         Output('group-rated-voltage', 'children'),
         Output('group-flashover-status', 'children'),
@@ -306,7 +545,6 @@ def app_callbacks(app, archivo_hdf5):
         triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
         current_excluded = current_excluded or {}
 
-        # ── Reset: limpia exclusiones del grupo actual ───────────────────
         if triggered_id == 'btn-reset-exclusions':
             if selected_group and selected_group in current_excluded:
                 updated = dict(current_excluded)
@@ -314,7 +552,6 @@ def app_callbacks(app, archivo_hdf5):
                 return updated
             return no_update
 
-        # ── Exclude: agrega los IDs seleccionados ────────────────────────
         if triggered_id == 'btn-exclude-points':
             if not selected_group:
                 return no_update
@@ -330,7 +567,6 @@ def app_callbacks(app, archivo_hdf5):
 
         return no_update
 
-    # ── EXCLUSION STATUS LABEL ───────────────────────────────────────────────
     @app.callback(
         Output('exclusion-status', 'children'),
         Input('store-excluded',    'data'),
@@ -353,7 +589,7 @@ def app_callbacks(app, archivo_hdf5):
             ),
         ])
 
-    # -- TIME SERIES ---------------------------------------------------------
+    # ── TIME SERIES ──────────────────────────────────────────────────────────
     @app.callback(
         Output('graph-3', 'figure'),
         Input('dropdown-y-axis',    'value'),
@@ -377,21 +613,14 @@ def app_callbacks(app, archivo_hdf5):
         if not metrics_data:
             return empty_fig(460)
 
-        # -- exclusiones permanentes (tienen prioridad) -------------------
+        is_fmt2 = metrics_data.get('_format') == 'fmt2'
+
         excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
         excl_keep    = apply_exclusion_to_metrics(metrics_data, excluded_ids)
-
-        # -- selección lasso sobre scatter (highlight temporal) -----------
         selected_ids = extract_selected_signal_ids(scatter_selection)
         filter_idx   = filter_by_signal_ids(metrics_data, selected_ids)
 
-        # combinar: primero aplicar exclusión, luego filtro de selección
         def merge_indices(excl_keep, filter_idx):
-            """
-            excl_keep : lista de índices que NO están excluidos (o None = todos)
-            filter_idx: lista de índices seleccionados por lasso (o None = todos)
-            Devuelve la intersección como lista ordenada, o None si no hay restricción.
-            """
             if excl_keep is None and filter_idx is None:
                 return None
             base = set(excl_keep) if excl_keep is not None else set(range(len(metrics_data['signal_ids'])))
@@ -405,7 +634,6 @@ def app_callbacks(app, archivo_hdf5):
         try:
             base_metric = next((m for m in y_metrics if m != 'ATBS'), None)
 
-            # x axis for metrics
             if x_mode == 'timestamp':
                 x_data  = metrics_data['timestamp']
                 x_label = 'Timestamp (s)'
@@ -413,18 +641,16 @@ def app_callbacks(app, archivo_hdf5):
                 x_data  = list(range(len(metrics_data[base_metric]))) if base_metric else []
                 x_label = 'Index'
 
-            # -- compute ranges usando solo los puntos visibles -----------
             all_x, all_y = [], []
             for ym in y_metrics:
                 if ym == 'ATBS':
                     xm = metrics_data['ATBS_timestamp'] if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
                     yv = np.array(metrics_data['ATBS'])
-                    # para ATBS, el excl_keep se aplica sobre los primeros N indices
                     if effective_idx is not None:
-                        atbs_len = len(metrics_data['ATBS'])
+                        atbs_len  = len(metrics_data['ATBS'])
                         atbs_keep = [i for i in effective_idx if i < atbs_len]
-                        xm_eff = [xm[i] for i in atbs_keep]
-                        yv_eff = yv[atbs_keep]
+                        xm_eff    = [xm[i] for i in atbs_keep]
+                        yv_eff    = yv[atbs_keep]
                     else:
                         xm_eff, yv_eff = xm, yv
                 else:
@@ -444,14 +670,13 @@ def app_callbacks(app, archivo_hdf5):
 
             fig = go.Figure()
 
-            # -- primary traces (y1) -----------------------------------------
             for idx, ym in enumerate(y_metrics):
                 if ym == 'ATBS':
                     xm   = metrics_data['ATBS_timestamp'] if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
                     yv   = np.array(metrics_data['ATBS'])
                     sids = metrics_data['signal_ids'][:len(metrics_data['ATBS'])]
                     if effective_idx is not None:
-                        atbs_len = len(metrics_data['ATBS'])
+                        atbs_len  = len(metrics_data['ATBS'])
                         atbs_keep = [i for i in effective_idx if i < atbs_len]
                         xm   = [xm[i] for i in atbs_keep]
                         yv   = yv[atbs_keep]
@@ -470,8 +695,6 @@ def app_callbacks(app, archivo_hdf5):
 
                 cd    = np.column_stack((np.array(sids), np.full(len(sids), selected_group)))
                 color = COLORS[idx % len(COLORS)]
-
-                # mostrar marcadores si hay selección lasso activa
                 marker_opacity = 0.9 if filter_idx is not None else 0
 
                 fig.add_trace(go.Scattergl(
@@ -482,15 +705,15 @@ def app_callbacks(app, archivo_hdf5):
                     opacity=0.85, yaxis='y1',
                 ))
 
-            # -- Relative Humidity (y2) --------------------------------------
+            # Relative Humidity — fmt1 y fmt2
             rh_h = metrics_data.get('rh_humidity',   [])
             rh_t = metrics_data.get('rh_timestamps', [])
             rh_y2_range = None
 
             if rh_h and rh_t:
-                rh_h_arr = np.array(rh_h)
-                rh_t_arr = np.array(rh_t)
-                rh_y2_range = full_range(rh_h_arr)
+                rh_h_arr     = np.array(rh_h)
+                rh_t_arr     = np.array(rh_t)
+                rh_y2_range  = full_range(rh_h_arr)
                 rh_t_shifted = rh_t_arr - rh_t_arr[0]
 
                 if x_mode == 'timestamp':
@@ -502,18 +725,12 @@ def app_callbacks(app, archivo_hdf5):
                     rh_x      = list(range(len(metrics_t)))
 
                 fig.add_trace(go.Scattergl(
-                    x=rh_x,
-                    y=rh_y_plot,
-                    mode='lines',
+                    x=rh_x, y=rh_y_plot, mode='lines',
                     line=dict(color='#ffaa00', width=1.5, dash='dot'),
-                    name='Rel. Humidity (%)',
-                    yaxis='y2',
-                    opacity=0.85,
+                    name='Rel. Humidity (%)', yaxis='y2', opacity=0.85,
                 ))
 
-            # -- layout ------------------------------------------------------
             y_title = 'Normalized' if (normalize and len(y_metrics) > 1) else 'Value'
-
             layout = base_layout(
                 460,
                 hovermode='closest', clickmode='event+select',
@@ -524,14 +741,11 @@ def app_callbacks(app, archivo_hdf5):
             layout['yaxis']  = dict(range=y_rng, title=y_title,  **AXIS_STYLE)
             layout['yaxis2'] = dict(
                 title='Humidity (%)',
-                overlaying='y',
-                side='right',
-                showgrid=False,
+                overlaying='y', side='right', showgrid=False,
                 range=rh_y2_range,
                 tickfont=dict(color='#ffaa00', size=9),
                 title_font=dict(color='#ffaa00', size=10),
-                linecolor=C['border2'],
-                zerolinecolor=C['border2'],
+                linecolor=C['border2'], zerolinecolor=C['border2'],
             )
             fig.update_layout(layout)
             return fig
@@ -541,7 +755,7 @@ def app_callbacks(app, archivo_hdf5):
             import traceback; traceback.print_exc()
             return empty_fig(460)
 
-    # -- SCATTER -------------------------------------------------------------
+    # ── SCATTER ──────────────────────────────────────────────────────────────
     @app.callback(
         Output('graph-4', 'figure'),
         Input('dropdown-x-axis',        'value'),
@@ -570,15 +784,11 @@ def app_callbacks(app, archivo_hdf5):
         if not metrics_data:
             return empty_fig(460)
 
-        # -- exclusiones permanentes --------------------------------------
         excluded_ids = get_excluded_ids_for_group(store_excluded, selected_group)
         excl_keep    = apply_exclusion_to_metrics(metrics_data, excluded_ids)
-
-        # -- selección lasso de time series (highlight) -------------------
         selected_ids = extract_selected_signal_ids(ts_selection)
         filter_idx   = filter_by_signal_ids(metrics_data, selected_ids)
 
-        # -- índice efectivo: intersección exclusión + selección ----------
         def effective_index(excl_keep, filter_idx, total):
             if excl_keep is None and filter_idx is None:
                 return None
@@ -588,8 +798,7 @@ def app_callbacks(app, archivo_hdf5):
             result = sorted(base)
             return result if result else []
 
-        eff_idx = effective_index(excl_keep, filter_idx,
-                                  len(metrics_data['signal_ids']))
+        eff_idx = effective_index(excl_keep, filter_idx, len(metrics_data['signal_ids']))
 
         try:
             x_vals = np.array(metrics_data[x_metric], dtype=float)
@@ -602,7 +811,6 @@ def app_callbacks(app, archivo_hdf5):
                 y_vals = y_vals[eff_idx]
                 cd     = cd[eff_idx]
 
-            # -- 3D ----------------------------------------------------------
             if z_metric:
                 z_vals = np.array(metrics_data[z_metric], dtype=float)
                 if eff_idx is not None:
@@ -626,7 +834,6 @@ def app_callbacks(app, archivo_hdf5):
             x_rng = full_range(x_vals) if len(x_vals) else None
             y_rng = full_range(y_vals) if len(y_vals) else None
 
-            # -- static ------------------------------------------------------
             if not do_animate:
                 fig = go.Figure()
                 fig.add_trace(go.Scattergl(
@@ -641,7 +848,6 @@ def app_callbacks(app, archivo_hdf5):
                 fig.update_layout(layout)
                 return fig
 
-            # -- animation ---------------------------------------------------
             n    = len(x_vals)
             step = anim_step if anim_step > 0 else max(1, n // 200)
             x_list = x_vals.tolist()
@@ -712,6 +918,7 @@ def app_callbacks(app, archivo_hdf5):
             import traceback; traceback.print_exc()
             return empty_fig(460)
 
+    # ── SEÑAL TEMPORAL ───────────────────────────────────────────────────────
     @app.callback(
         Output('graph-1', 'figure'),
         Input('graph-3', 'clickData'),
@@ -743,6 +950,7 @@ def app_callbacks(app, archivo_hdf5):
             print(f"Error temporal: {e}")
             return empty_fig(340)
 
+    # ── FFT ──────────────────────────────────────────────────────────────────
     @app.callback(
         Output('graph-2', 'figure'),
         Input('graph-3', 'clickData'),
@@ -760,19 +968,32 @@ def app_callbacks(app, archivo_hdf5):
             fft = hdf5_manager.get_fft_data(group_name, signal_id)
             if not len(fft):
                 return empty_fig(340)
+
+            fmt = hdf5_manager.get_format(group_name)
+            if fmt == 'fmt2':
+                sig  = hdf5_manager.get_signal_data(group_name, signal_id)
+                freq = rfftfreq(len(sig), d=1.0 / SAMPLE_RATE) / 1e6
+                x_data  = freq.tolist()
+                x_title = 'Frequency (MHz)'
+            else:
+                x_data  = list(range(len(fft)))
+                x_title = 'Frequency (MHz)'
+
             fig = go.Figure()
             fig.add_trace(go.Scattergl(
-                y=fft, mode='lines', line=dict(color=C['red'], width=1), name='FFT',
+                x=x_data, y=fft.tolist() if hasattr(fft, 'tolist') else list(fft),
+                mode='lines', line=dict(color=C['red'], width=1), name='FFT',
             ))
             layout = base_layout(340)
-            layout['xaxis'] = dict(title='Frequency (MHz)', **AXIS_STYLE)
-            layout['yaxis'] = dict(title='Magnitude',        **AXIS_STYLE)
+            layout['xaxis'] = dict(title=x_title,    **AXIS_STYLE)
+            layout['yaxis'] = dict(title='Magnitude', **AXIS_STYLE)
             fig.update_layout(layout)
             return fig
         except Exception as e:
             print(f"Error FFT: {e}")
             return empty_fig(340)
 
+    # ── DOWNLOADS ────────────────────────────────────────────────────────────
     @app.callback(
         Output('download-scatter-csv', 'data'),
         Input('btn-download-scatter', 'n_clicks'),
@@ -801,7 +1022,6 @@ def app_callbacks(app, archivo_hdf5):
         selected_ids = extract_selected_signal_ids(ts_selection)
         filter_idx   = filter_by_signal_ids(metrics_data, selected_ids)
 
-        # merge
         total = len(metrics_data['signal_ids'])
         base  = set(excl_keep) if excl_keep is not None else set(range(total))
         if filter_idx is not None:
@@ -845,7 +1065,6 @@ def app_callbacks(app, archivo_hdf5):
         selected_ids = (extract_selected_signal_ids(ts_selection)
                         or extract_selected_signal_ids(sc_selection))
 
-        # filtrar: excluir excluidos + respetar selección
         all_ids = metrics_data['signal_ids']
         if selected_ids:
             signal_ids = [sid for sid in all_ids
@@ -868,7 +1087,6 @@ def app_callbacks(app, archivo_hdf5):
             w.writerow(row)
         return dcc.send_string(buf.getvalue(), f'signals_{selected_group}.csv')
 
-    # -- DOWNLOAD SIGNAL NAMES -----------------------------------------------
     @app.callback(
         Output('download-signal-names-csv', 'data'),
         Input('btn-download-signal-names', 'n_clicks'),
@@ -902,9 +1120,9 @@ def app_callbacks(app, archivo_hdf5):
         w.writerow(['signal_id'])
         for sid in signal_ids:
             w.writerow([sid])
-
         return dcc.send_string(buf.getvalue(), f'signal_names_{selected_group}.csv')
 
+    # ── SELECTIONS STORE ─────────────────────────────────────────────────────
     @app.callback(
         Output('store-selections', 'data'),
         Input('btn-insert-selection', 'n_clicks'),
@@ -985,6 +1203,7 @@ def app_callbacks(app, archivo_hdf5):
             }))
         return items
 
+    # ── COMPARE CALLBACKS ────────────────────────────────────────────────────
     @app.callback(
         Output('graph-compare-avg-fft', 'figure'),
         Input('store-selections', 'data'),
@@ -1007,8 +1226,17 @@ def app_callbacks(app, archivo_hdf5):
             max_len = max(len(f) for f in ffts)
             padded  = [np.pad(f, (0, max_len - len(f))) for f in ffts]
             avg_fft = np.mean(padded, axis=0)
+
+            fmt = hdf5_manager.get_format(group)
+            if fmt == 'fmt2' and sids:
+                sig  = hdf5_manager.get_signal_data(group, sids[0])
+                freq = rfftfreq(len(sig), d=1.0 / SAMPLE_RATE) / 1e6
+                x_fft = freq[:len(avg_fft)].tolist()
+            else:
+                x_fft = list(range(len(avg_fft)))
+
             fig.add_trace(go.Scattergl(
-                y=avg_fft, mode='lines',
+                x=x_fft, y=avg_fft.tolist(), mode='lines',
                 line=dict(color=sel['color'], width=1.5),
                 name=sel['name'], opacity=0.85,
             ))
@@ -1069,9 +1297,17 @@ def app_callbacks(app, archivo_hdf5):
                 fft = hdf5_manager.get_fft_data(group, sid)
                 if not len(fft):
                     continue
+                fmt = hdf5_manager.get_format(group)
+                if fmt == 'fmt2':
+                    sig  = hdf5_manager.get_signal_data(group, sid)
+                    freq = rfftfreq(len(sig), d=1.0 / SAMPLE_RATE) / 1e6
+                    x_fft = freq[:len(fft)].tolist()
+                else:
+                    x_fft = list(range(len(fft)))
+
                 fig.add_trace(go.Scattergl(
-                    y=fft, mode='lines',
-                    line=dict(color=sel['color'], width=0.8),
+                    x=x_fft, y=fft.tolist() if hasattr(fft, 'tolist') else list(fft),
+                    mode='lines', line=dict(color=sel['color'], width=0.8),
                     name=sel['name'] if i == 0 else None,
                     showlegend=(i == 0), opacity=0.6,
                     legendgroup=sel['name'],
@@ -1148,15 +1384,8 @@ def app_callbacks(app, archivo_hdf5):
         layout['yaxis'] = dict(title=metric,      **AXIS_STYLE)
         fig.update_layout(layout)
         return fig
-    
-    # ─────────────────────────────────────────────────────────────────────────────
-# PATCH: agregar estos dos clientside_callbacks al final de app_callbacks()
-# en callbacks.py, justo antes del @atexit.register
-# ─────────────────────────────────────────────────────────────────────────────
 
     # ── COPY GROUP NAME (clientside) ─────────────────────────────────────────
-
-    # 1. Sincroniza el span oculto con el valor del dropdown
     app.clientside_callback(
         """
         function(group_value) {
@@ -1167,7 +1396,6 @@ def app_callbacks(app, archivo_hdf5):
         Input('dropdown-group', 'value'),
     )
 
-    # 2. Al hacer click en el botón, copia el texto del span al portapapeles
     app.clientside_callback(
         """
         function(n_clicks) {
@@ -1197,7 +1425,7 @@ def app_callbacks(app, archivo_hdf5):
         Input('btn-copy-group-name', 'n_clicks'),
         prevent_initial_call=True,
     )
-    
+
     @atexit.register
     def cleanup():
         if _hdf5_manager:

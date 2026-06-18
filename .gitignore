@@ -4,6 +4,13 @@ Deprecated/
 Main Databases/
 venv/
 Videos and GIFs/
+envelope experiment analyzer/
+Filtered 25kv datasets/
+group_extractor/
+images/
+Processed Metrics/
+Videos and GIFs/
+
 ._.git
 master.hdf5
 Main DB.hdf5

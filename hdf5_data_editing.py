@@ -6,7 +6,7 @@ from scipy.stats import kurtosis, skew
 from scipy.signal import butter, sosfiltfilt
 
 # Configuración
-file = 'Main Databases/selected_25_kv_signals.hdf5'
+file = 'Main Databases/new_master.hdf5'
 time_ref = np.linspace(0, 1, 3000)
 band_ranges = [(0, 200e6), (200e6, 1499e6)]
 band_names = ['B0', 'B1']
@@ -15,7 +15,7 @@ FS = 3e9
 FC_HPF = 10e6
 
 # ── Si True, borra y recalcula Metrics aunque ya existan ──────────────────
-FORCE_RECALC = True
+FORCE_RECALC = False
 # ─────────────────────────────────────────────────────────────────────────
 
 EXPECTED_DATASETS = set(mtrcs_keys + band_names + ['timestamp', 'kurtosis', 'skewness', 'crest_factor'])
