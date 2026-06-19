@@ -715,8 +715,13 @@ def app_callbacks(app, archivo_hdf5):
         try:
             base_metric = next((m for m in y_metrics if m != 'ATBS'), None)
 
+            # Referencia temporal: senales/metricas parten de 0 (igual que la humedad)
+            ts_full = np.array(metrics_data['timestamp'], dtype=float)
+            t0 = float(ts_full[0]) if len(ts_full) else 0.0
+            atbs_ts_shifted = [t - t0 for t in metrics_data['ATBS_timestamp']]
+
             if x_mode == 'timestamp':
-                x_data  = metrics_data['timestamp']
+                x_data  = (ts_full - t0).tolist()
                 x_label = 'Timestamp (s)'
             else:
                 x_data  = list(range(len(metrics_data[base_metric]))) if base_metric else []
@@ -725,7 +730,7 @@ def app_callbacks(app, archivo_hdf5):
             all_x, all_y = [], []
             for ym in y_metrics:
                 if ym == 'ATBS':
-                    xm = metrics_data['ATBS_timestamp'] if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
+                    xm = atbs_ts_shifted if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
                     yv = np.array(metrics_data['ATBS'])
                     if effective_idx is not None:
                         atbs_len  = len(metrics_data['ATBS'])
@@ -753,7 +758,7 @@ def app_callbacks(app, archivo_hdf5):
 
             for idx, ym in enumerate(y_metrics):
                 if ym == 'ATBS':
-                    xm   = metrics_data['ATBS_timestamp'] if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
+                    xm   = atbs_ts_shifted if x_mode == 'timestamp' else list(range(len(metrics_data['ATBS'])))
                     yv   = np.array(metrics_data['ATBS'])
                     sids = metrics_data['signal_ids'][:len(metrics_data['ATBS'])]
                     if effective_idx is not None:
@@ -1452,7 +1457,9 @@ def app_callbacks(app, archivo_hdf5):
             filter_idx = filter_by_signal_ids(metrics_data, set(sel['signal_ids']))
             if filter_idx is None:
                 continue
-            timestamps = np.array(metrics_data['timestamp'])[filter_idx]
+            ts_arr = np.array(metrics_data['timestamp'])[filter_idx]
+            t0 = ts_arr[0] if len(ts_arr) else 0
+            timestamps = (ts_arr - t0)
             values     = np.array(metrics_data[metric])[filter_idx]
             fig.add_trace(go.Scattergl(
                 x=timestamps, y=values, mode='lines+markers',
