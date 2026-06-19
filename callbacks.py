@@ -47,16 +47,16 @@ AXIS_STYLE = dict(
     linecolor=C['border2'], zerolinecolor=C['border2'],
 )
 
-# Parámetros FFT para formato 2
-SAMPLE_RATE   = 3e9          # 3 GS/s — ajustar si difiere
-B0_MAX_HZ     = 100e6        # 0–100 MHz
-B1_MIN_HZ     = 100e6        # 100–600 MHz
+# Parametros FFT para formato 2
+SAMPLE_RATE   = 3e9          # 3 GS/s - ajustar si difiere
+B0_MAX_HZ     = 100e6        # 0-100 MHz
+B1_MIN_HZ     = 100e6        # 100-600 MHz
 B1_MAX_HZ     = 600e6
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers de cálculo de métricas desde señales raw (formato 2)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Helpers de calculo de metricas desde senales raw (formato 2)
+# -----------------------------------------------------------------------------
 
 def _compute_metrics_from_signals(signals: np.ndarray,
                                   timestamps: np.ndarray,
@@ -133,15 +133,16 @@ def _detect_format(group) -> str:
     return 'fmt1'
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # HDF5Manager
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class HDF5Manager:
     def __init__(self, filepath):
         self.filepath = filepath
         self._file = None
         self._fmt2_cache = {}
+        self._precomputed = {}
 
     @property
     def file(self):
@@ -152,7 +153,67 @@ class HDF5Manager:
     def get_all_groups(self):
         return list(self.file.keys())
 
-    # ── Formato 1 ────────────────────────────────────────────────────────────
+    # -- Metricas precalculadas (precompute_metrics.py) -----------------------
+
+    def _load_precomputed(self, group_name):
+        """Lee el grupo 'Metrics' escrito por precompute_metrics.py.
+        Devuelve None si no existe o esta incompleto (entonces se recalcula)."""
+        if group_name in self._precomputed:
+            return self._precomputed[group_name]
+        try:
+            grp = self.file[group_name]
+            if 'Metrics' not in grp:
+                return None
+            m = grp['Metrics']
+            req = {'vpp', 'eqTime', 'eqFreq', 'energy', 'B0', 'B1',
+                   'kurtosis', 'skewness', 'crest_factor', 'timestamp'}
+            if not req.issubset(set(m.keys())):
+                return None
+            # signal_ids es obligatorio para mapear puntos -> senales
+            if 'signal_ids' not in m:
+                return None
+
+            data = {k: m[k][:].tolist() for k in req}
+            raw_ids = m['signal_ids'][:]
+            data['signal_ids'] = [s.decode() if isinstance(s, (bytes, np.bytes_)) else str(s)
+                                  for s in raw_ids]
+
+            # Humedad (ligera, no toca las senales)
+            rh_h, rh_t = [], []
+            if 'Relative Humidity' in grp:
+                try:
+                    rhg = grp['Relative Humidity']
+                    rh_h = rhg['humidity'][:].tolist()
+                    rh_t = rhg['timestamps'][:].tolist()
+                except Exception:
+                    pass
+            else:
+                for cn in sorted(grp.keys()):
+                    if cn == 'Metrics':
+                        continue
+                    try:
+                        rhg = grp[cn]['humidity']
+                        rh_h.extend(rhg['humidity'][:].tolist())
+                        rh_t.extend(rhg['timestamps'][:].tolist())
+                    except Exception:
+                        continue
+                if rh_t:
+                    pairs = sorted(zip(rh_t, rh_h))
+                    rh_t = [p[0] for p in pairs]
+                    rh_h = [p[1] for p in pairs]
+
+            data['rh_humidity']   = rh_h
+            data['rh_timestamps'] = rh_t
+            data['group']         = group_name
+            data['_format']       = 'fmt2'
+            self._precomputed[group_name] = data
+            print(f"[precomputed] {group_name}: {len(data['signal_ids'])} senales leidas de Metrics")
+            return data
+        except Exception as e:
+            print(f"[precomputed] Error en {group_name}: {e}")
+            return None
+
+    # -- Formato 1 ------------------------------------------------------------
 
     def _get_metrics_fmt1(self, group_name, atbs_window=5):
         try:
@@ -202,7 +263,7 @@ class HDF5Manager:
             print(f"Error leyendo grupo fmt1 {group_name}: {e}")
             return None
 
-    # ── Formato 2 ────────────────────────────────────────────────────────────
+    # -- Formato 2 ------------------------------------------------------------
 
     def _get_metrics_fmt2(self, group_name, atbs_window=5):
         if group_name in self._fmt2_cache:
@@ -287,7 +348,7 @@ class HDF5Manager:
                 '_format':        'fmt2',
             }
             self._fmt2_cache[group_name] = result
-            print(f"[fmt2] {group_name}: {len(all_signal_ids)} señales calculadas")
+            print(f"[fmt2] {group_name}: {len(all_signal_ids)} senales calculadas")
             return result
 
         except Exception as e:
@@ -295,7 +356,7 @@ class HDF5Manager:
             import traceback; traceback.print_exc()
             return None
 
-    # ── Interfaz pública ─────────────────────────────────────────────────────
+    # -- Interfaz publica -----------------------------------------------------
 
     def get_format(self, group_name):
         try:
@@ -308,6 +369,21 @@ class HDF5Manager:
             return None
         fmt = self.get_format(group_name)
         if fmt == 'fmt2':
+            # PRIORIDAD: usar metricas precalculadas si existen.
+            # Evita recalcular FFT por senal en cada seleccion (causa del 'updating').
+            pre = self._load_precomputed(group_name)
+            if pre is not None:
+                ts = pre['timestamp']
+                atbs_values, atbs_timestamps, atbs_cumulative = [], [], 0
+                for i in range(atbs_window - 1, len(ts)):
+                    dt = (ts[i] - ts[i - atbs_window + 1]) / max(atbs_window - 1, 1)
+                    atbs_cumulative += dt
+                    atbs_values.append(atbs_cumulative)
+                    atbs_timestamps.append(ts[i])
+                res = dict(pre)
+                res['ATBS'] = atbs_values
+                res['ATBS_timestamp'] = atbs_timestamps
+                return res
             return self._get_metrics_fmt2(group_name, atbs_window)
         return self._get_metrics_fmt1(group_name, atbs_window)
 
@@ -316,7 +392,12 @@ class HDF5Manager:
         if fmt == 'fmt2':
             try:
                 sig_map = getattr(self, '_fmt2_signal_map', {})
-                chunk_name, idx = sig_map[group_name][signal_id]
+                if group_name in sig_map and signal_id in sig_map[group_name]:
+                    chunk_name, idx = sig_map[group_name][signal_id]
+                else:
+                    # Reconstruir desde el id "chunk::idx" (modo precalculado)
+                    chunk_name, idx_str = signal_id.rsplit('::', 1)
+                    idx = int(idx_str)
                 return self.file[group_name][chunk_name]['signals']['data'][idx].astype(np.float64)
             except Exception as e:
                 print(f"[fmt2] Error get_signal_data {signal_id}: {e}")
@@ -350,9 +431,9 @@ class HDF5Manager:
             self._file = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Singleton
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 _hdf5_manager = None
 
@@ -364,9 +445,9 @@ def get_hdf5_manager(filepath):
     return _hdf5_manager
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers genéricos
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Helpers genericos
+# -----------------------------------------------------------------------------
 
 def normalize_data(data):
     a = np.array(data)
@@ -437,9 +518,9 @@ def empty_fig(height=460):
     return fig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Callbacks
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def app_callbacks(app, archivo_hdf5):
     hdf5_manager = get_hdf5_manager(archivo_hdf5)
@@ -524,7 +605,7 @@ def app_callbacks(app, archivo_hdf5):
             print(f"Error leyendo atributos de grupo: {e}")
             return '--', '--', {**base_style, 'color': C['text_dim']}
 
-    # ── EXCLUSION STORE ──────────────────────────────────────────────────────
+    # -- EXCLUSION STORE ------------------------------------------------------
     @app.callback(
         Output('store-excluded', 'data'),
         Input('btn-exclude-points',   'n_clicks'),
@@ -581,7 +662,7 @@ def app_callbacks(app, archivo_hdf5):
                 'fontSize': '10px',
             })
         return html.Span([
-            html.Span('⊘ ', style={'color': C['orange'], 'fontSize': '12px'}),
+            html.Span('o ', style={'color': C['orange'], 'fontSize': '12px'}),
             html.Span(
                 f'{n} signal{"s" if n != 1 else ""} excluded from this group',
                 style={'color': C['orange'], 'fontFamily': "'JetBrains Mono', monospace",
@@ -589,7 +670,7 @@ def app_callbacks(app, archivo_hdf5):
             ),
         ])
 
-    # ── TIME SERIES ──────────────────────────────────────────────────────────
+    # -- TIME SERIES ----------------------------------------------------------
     @app.callback(
         Output('graph-3', 'figure'),
         Input('dropdown-y-axis',    'value'),
@@ -705,7 +786,7 @@ def app_callbacks(app, archivo_hdf5):
                     opacity=0.85, yaxis='y1',
                 ))
 
-            # Relative Humidity — fmt1 y fmt2
+            # Relative Humidity - fmt1 y fmt2
             rh_h = metrics_data.get('rh_humidity',   [])
             rh_t = metrics_data.get('rh_timestamps', [])
             rh_y2_range = None
@@ -755,7 +836,7 @@ def app_callbacks(app, archivo_hdf5):
             import traceback; traceback.print_exc()
             return empty_fig(460)
 
-    # ── SCATTER ──────────────────────────────────────────────────────────────
+    # -- SCATTER --------------------------------------------------------------
     @app.callback(
         Output('graph-4', 'figure'),
         Input('dropdown-x-axis',        'value'),
@@ -918,7 +999,7 @@ def app_callbacks(app, archivo_hdf5):
             import traceback; traceback.print_exc()
             return empty_fig(460)
 
-    # ── SEÑAL TEMPORAL ───────────────────────────────────────────────────────
+    # -- SENAL TEMPORAL -------------------------------------------------------
     @app.callback(
         Output('graph-1', 'figure'),
         Input('graph-3', 'clickData'),
@@ -950,7 +1031,7 @@ def app_callbacks(app, archivo_hdf5):
             print(f"Error temporal: {e}")
             return empty_fig(340)
 
-    # ── FFT ──────────────────────────────────────────────────────────────────
+    # -- FFT ------------------------------------------------------------------
     @app.callback(
         Output('graph-2', 'figure'),
         Input('graph-3', 'clickData'),
@@ -993,7 +1074,7 @@ def app_callbacks(app, archivo_hdf5):
             print(f"Error FFT: {e}")
             return empty_fig(340)
 
-    # ── DOWNLOADS ────────────────────────────────────────────────────────────
+    # -- DOWNLOADS ------------------------------------------------------------
     @app.callback(
         Output('download-scatter-csv', 'data'),
         Input('btn-download-scatter', 'n_clicks'),
@@ -1122,7 +1203,7 @@ def app_callbacks(app, archivo_hdf5):
             w.writerow([sid])
         return dcc.send_string(buf.getvalue(), f'signal_names_{selected_group}.csv')
 
-    # ── SELECTIONS STORE ─────────────────────────────────────────────────────
+    # -- SELECTIONS STORE -----------------------------------------------------
     @app.callback(
         Output('store-selections', 'data'),
         Input('btn-insert-selection', 'n_clicks'),
@@ -1203,7 +1284,7 @@ def app_callbacks(app, archivo_hdf5):
             }))
         return items
 
-    # ── COMPARE CALLBACKS ────────────────────────────────────────────────────
+    # -- COMPARE CALLBACKS ----------------------------------------------------
     @app.callback(
         Output('graph-compare-avg-fft', 'figure'),
         Input('store-selections', 'data'),
@@ -1385,7 +1466,7 @@ def app_callbacks(app, archivo_hdf5):
         fig.update_layout(layout)
         return fig
 
-    # ── COPY GROUP NAME (clientside) ─────────────────────────────────────────
+    # -- COPY GROUP NAME (clientside) -----------------------------------------
     app.clientside_callback(
         """
         function(group_value) {
@@ -1409,7 +1490,7 @@ def app_callbacks(app, archivo_hdf5):
                 var orig = btn.innerText;
                 var origColor = btn.style.color;
                 var origBorder = btn.style.borderColor;
-                btn.innerText = '\u2713';
+                btn.innerText = '\\u2713';
                 btn.style.color = '#00ff9d';
                 btn.style.borderColor = '#00ff9d';
                 setTimeout(function() {
