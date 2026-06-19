@@ -781,11 +781,10 @@ def app_callbacks(app, archivo_hdf5):
 
                 cd    = np.column_stack((np.array(sids), np.full(len(sids), selected_group)))
                 color = COLORS[idx % len(COLORS)]
-                marker_opacity = 0.9 if filter_idx is not None else 0
 
                 fig.add_trace(go.Scattergl(
                     x=xm, y=yv.tolist(), mode='lines+markers',
-                    marker=dict(size=3, color=color, opacity=marker_opacity),
+                    marker=dict(size=3, color=color, opacity=0),
                     line=dict(color=color, width=1),
                     customdata=cd, name=band_labels.get(ym, ym),
                     opacity=0.85, yaxis='y1',
