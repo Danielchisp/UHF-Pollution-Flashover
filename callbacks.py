@@ -819,7 +819,7 @@ def app_callbacks(app, archivo_hdf5):
             y_title = 'Normalized' if (normalize and len(y_metrics) > 1) else 'Value'
             layout = base_layout(
                 460,
-                hovermode='closest', clickmode='event+select',
+                hovermode='closest', clickmode='event',
                 showlegend=True, dragmode='lasso',
                 uirevision=selected_group,
             )
@@ -927,7 +927,7 @@ def app_callbacks(app, archivo_hdf5):
                     marker=dict(size=3, color=C['red'], opacity=0.65),
                     customdata=cd, name=f'{y_metric} vs {x_metric}',
                 ))
-                layout = base_layout(460, hovermode='closest', clickmode='event+select',
+                layout = base_layout(460, hovermode='closest', clickmode='event',
                                      dragmode='lasso', uirevision=selected_group)
                 layout['xaxis'] = dict(range=x_rng, title=x_metric, **AXIS_STYLE)
                 layout['yaxis'] = dict(range=y_rng, title=y_metric, **AXIS_STYLE)
